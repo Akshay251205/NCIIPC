@@ -1,0 +1,1135 @@
+from collections import defaultdict
+
+from sqlalchemy import case, func
+
+from app.database import SessionLocal
+from app.models import Analyst
+from app.models import Alert
+from app.models import Investigation
+from app.services.rules.analyst_rules import evaluate_analyst_behavior
+
+
+def _get_base_analyst_metrics() -> list[dict]:
+    """
+    Generate intelligence metrics for all analysts.
+
+    Uses grouped SQL aggregation to avoid the N+1 query problem.
+    """
+
+    db = SessionLocal()
+
+    try:
+        # ==========================================================
+        # 1. Load analysts
+        # ==========================================================
+
+        analysts = db.query(Analyst).all()
+
+        # ==========================================================
+        # 2. Aggregate ALL alert metrics in one SQL query
+        # ==========================================================
+
+        alert_rows = (
+            db.query(
+                Alert.analyst_id.label("analyst_id"),
+
+                func.count(Alert.alert_id).label(
+                    "total_alerts"
+                ),
+
+                func.sum(
+                    case(
+                        (Alert.status == "Closed", 1),
+                        else_=0,
+                    )
+                ).label("closed_alerts"),
+
+                func.sum(
+                    case(
+                        (Alert.status == "Open", 1),
+                        else_=0,
+                    )
+                ).label("open_alerts"),
+
+                func.sum(
+                    case(
+                        (Alert.status == "Investigating", 1),
+                        else_=0,
+                    )
+                ).label("investigating_alerts"),
+
+                func.sum(
+                    case(
+                        (Alert.escalated.is_(True), 1),
+                        else_=0,
+                    )
+                ).label("escalated_alerts"),
+
+                func.sum(
+                    case(
+                        (Alert.false_positive.is_(True), 1),
+                        else_=0,
+                    )
+                ).label("false_positives"),
+
+                func.sum(
+                    case(
+                        (Alert.evidence_reviewed.is_(True), 1),
+                        else_=0,
+                    )
+                ).label("evidence_reviewed_alerts"),
+
+                func.avg(
+                    Alert.closure_time_minutes
+                ).label("avg_closure_time"),
+            )
+            .group_by(Alert.analyst_id)
+            .all()
+        )
+
+        alert_metrics = {}
+
+        for row in alert_rows:
+            alert_metrics[row.analyst_id] = {
+                "total_alerts": int(row.total_alerts or 0),
+                "closed_alerts": int(row.closed_alerts or 0),
+                "open_alerts": int(row.open_alerts or 0),
+                "investigating_alerts": int(
+                    row.investigating_alerts or 0
+                ),
+                "escalated_alerts": int(
+                    row.escalated_alerts or 0
+                ),
+                "false_positives": int(
+                    row.false_positives or 0
+                ),
+                "evidence_reviewed_alerts": int(
+                    row.evidence_reviewed_alerts or 0
+                ),
+                "avg_closure_time": (
+                    float(row.avg_closure_time)
+                    if row.avg_closure_time is not None
+                    else None
+                ),
+            }
+
+        # ==========================================================
+        # 3. Aggregate investigation metrics in ONE query
+        # ==========================================================
+
+        investigation_rows = (
+            db.query(
+                Investigation.analyst_id.label(
+                    "analyst_id"
+                ),
+
+                func.count(
+                    Investigation.investigation_id
+                ).label("total_investigations"),
+
+                func.avg(
+                    Investigation.duration_minutes
+                ).label("avg_investigation_time"),
+
+                func.sum(
+                    case(
+                        (
+                            Investigation.evidence_reviewed.is_(True),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ).label(
+                    "evidence_reviewed_investigations"
+                ),
+
+                func.sum(
+                    case(
+                        (
+                            Investigation.escalation_decision
+                            == "Yes",
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ).label(
+                    "escalated_investigations"
+                ),
+            )
+            .group_by(Investigation.analyst_id)
+            .all()
+        )
+
+        investigation_metrics = {}
+
+        for row in investigation_rows:
+            investigation_metrics[row.analyst_id] = {
+                "total_investigations": int(
+                    row.total_investigations or 0
+                ),
+                "avg_investigation_time": (
+                    float(row.avg_investigation_time)
+                    if row.avg_investigation_time is not None
+                    else None
+                ),
+                "evidence_reviewed_investigations": int(
+                    row.evidence_reviewed_investigations or 0
+                ),
+                "escalated_investigations": int(
+                    row.escalated_investigations or 0
+                ),
+            }
+
+        # ==========================================================
+        # 4. Load investigation activity ONCE
+        #
+        # actions_performed = descriptive TEXT
+        # queries_executed = numeric
+        # ==========================================================
+
+        investigation_activity = (
+            db.query(
+                Investigation.analyst_id,
+                Investigation.actions_performed,
+                Investigation.queries_executed,
+            )
+            .all()
+        )
+
+        action_totals = defaultdict(int)
+        action_records = defaultdict(int)
+
+        query_totals = defaultdict(int)
+        query_records = defaultdict(int)
+
+        for investigation in investigation_activity:
+            analyst_id = investigation.analyst_id
+
+            # ------------------------------------------------------
+            # Actions
+            # ------------------------------------------------------
+
+            if investigation.actions_performed:
+                actions = [
+                    action.strip()
+                    for action in str(
+                        investigation.actions_performed
+                    ).split(";")
+                    if action.strip()
+                ]
+
+                if actions:
+                    action_totals[analyst_id] += len(actions)
+                    action_records[analyst_id] += 1
+
+            # ------------------------------------------------------
+            # Queries
+            # ------------------------------------------------------
+
+            if investigation.queries_executed is not None:
+                try:
+                    query_value = int(
+                        investigation.queries_executed
+                    )
+
+                    query_totals[analyst_id] += query_value
+                    query_records[analyst_id] += 1
+
+                except (TypeError, ValueError):
+                    # Ignore malformed values.
+                    pass
+
+        # ==========================================================
+        # 5. Build analyst intelligence
+        # ==========================================================
+
+        results = []
+
+        for analyst in analysts:
+            analyst_id = analyst.analyst_id
+
+            # ------------------------------------------------------
+            # Alert metrics
+            # ------------------------------------------------------
+
+            alerts = alert_metrics.get(
+                analyst_id,
+                {
+                    "total_alerts": 0,
+                    "closed_alerts": 0,
+                    "open_alerts": 0,
+                    "investigating_alerts": 0,
+                    "escalated_alerts": 0,
+                    "false_positives": 0,
+                    "evidence_reviewed_alerts": 0,
+                    "avg_closure_time": None,
+                },
+            )
+
+            total_alerts = alerts["total_alerts"]
+            closed_alerts = alerts["closed_alerts"]
+            open_alerts = alerts["open_alerts"]
+            investigating_alerts = alerts[
+                "investigating_alerts"
+            ]
+            escalated_alerts = alerts[
+                "escalated_alerts"
+            ]
+            false_positives = alerts[
+                "false_positives"
+            ]
+            evidence_reviewed_alerts = alerts[
+                "evidence_reviewed_alerts"
+            ]
+            avg_closure_time = alerts[
+                "avg_closure_time"
+            ]
+
+            # ------------------------------------------------------
+            # Investigation metrics
+            # ------------------------------------------------------
+
+            investigations = investigation_metrics.get(
+                analyst_id,
+                {
+                    "total_investigations": 0,
+                    "avg_investigation_time": None,
+                    "evidence_reviewed_investigations": 0,
+                    "escalated_investigations": 0,
+                },
+            )
+
+            total_investigations = investigations[
+                "total_investigations"
+            ]
+
+            avg_investigation_time = investigations[
+                "avg_investigation_time"
+            ]
+
+            evidence_reviewed_investigations = investigations[
+                "evidence_reviewed_investigations"
+            ]
+
+            escalated_investigations = investigations[
+                "escalated_investigations"
+            ]
+
+            # ------------------------------------------------------
+            # Average actions
+            # ------------------------------------------------------
+
+            if action_records[analyst_id] > 0:
+                avg_actions = (
+                    action_totals[analyst_id]
+                    / action_records[analyst_id]
+                )
+            else:
+                avg_actions = 0.0
+
+            # ------------------------------------------------------
+            # Average queries
+            # ------------------------------------------------------
+
+            if query_records[analyst_id] > 0:
+                avg_queries = (
+                    query_totals[analyst_id]
+                    / query_records[analyst_id]
+                )
+            else:
+                avg_queries = 0.0
+
+            # ======================================================
+            # 6. Calculate rates
+            # ======================================================
+
+            if total_alerts > 0:
+                closure_rate = round(
+                    closed_alerts
+                    / total_alerts
+                    * 100,
+                    2,
+                )
+
+                escalation_rate = round(
+                    escalated_alerts
+                    / total_alerts
+                    * 100,
+                    2,
+                )
+
+                false_positive_rate = round(
+                    false_positives
+                    / total_alerts
+                    * 100,
+                    2,
+                )
+
+                evidence_review_rate = round(
+                    evidence_reviewed_alerts
+                    / total_alerts
+                    * 100,
+                    2,
+                )
+
+            else:
+                closure_rate = 0.0
+                escalation_rate = 0.0
+                false_positive_rate = 0.0
+                evidence_review_rate = 0.0
+
+            # ------------------------------------------------------
+            # Investigation rates
+            # ------------------------------------------------------
+
+            if total_investigations > 0:
+                investigation_evidence_rate = round(
+                    evidence_reviewed_investigations
+                    / total_investigations
+                    * 100,
+                    2,
+                )
+
+                investigation_escalation_rate = round(
+                    escalated_investigations
+                    / total_investigations
+                    * 100,
+                    2,
+                )
+
+            else:
+                investigation_evidence_rate = 0.0
+                investigation_escalation_rate = 0.0
+
+            # ======================================================
+            # 7. Rule-based behavioral intelligence
+            # ======================================================
+
+            risk = evaluate_analyst_behavior(
+                total_alerts=total_alerts,
+                closed_alerts=closed_alerts,
+                avg_closure_time=avg_closure_time,
+                evidence_review_rate=evidence_review_rate,
+                escalation_rate=escalation_rate,
+                total_investigations=total_investigations,
+                avg_queries=avg_queries,
+                avg_investigation_time=avg_investigation_time,
+            )
+
+            risk_score = risk["score"]
+            risk_level = risk["level"]
+            confidence = risk["confidence"]
+            indicators = risk["indicators"]
+
+            # ======================================================
+            # 9. Store result
+            # ======================================================
+
+            results.append(
+                {
+                    "analyst_id": analyst.analyst_id,
+                    "name": analyst.name,
+                    "organization_id": analyst.organization_id,
+                    "role": analyst.role,
+                    "team": analyst.team,
+                    "experience_years": analyst.experience_years,
+                    "shift": analyst.shift,
+                    "status": analyst.status,
+                    "confidence": confidence,
+                    "alerts": {
+                        "total": total_alerts,
+                        "closed": closed_alerts,
+                        "open": open_alerts,
+                        "investigating": investigating_alerts,
+                        "escalated": escalated_alerts,
+                        "false_positives": false_positives,
+                    },
+                    "performance": {
+                        "average_closure_time_minutes": (
+                            round(
+                                float(avg_closure_time),
+                                2,
+                            )
+                            if avg_closure_time is not None
+                            else 0.0
+                        ),
+                        "closure_rate": closure_rate,
+                        "escalation_rate": escalation_rate,
+                        "false_positive_rate": false_positive_rate,
+                        "evidence_review_rate": evidence_review_rate,
+                    },
+                    "investigations": {
+                        "total": total_investigations,
+                        "average_duration_minutes": (
+                            round(
+                                float(
+                                    avg_investigation_time
+                                ),
+                                2,
+                            )
+                            if avg_investigation_time is not None
+                            else 0.0
+                        ),
+                        "average_queries": round(
+                            avg_queries,
+                            2,
+                        ),
+                        "average_actions": round(
+                            avg_actions,
+                            2,
+                        ),
+                        "evidence_review_rate": (
+                            investigation_evidence_rate
+                        ),
+                        "escalation_rate": (
+                            investigation_escalation_rate
+                        ),
+                    },
+                    "risk": {
+                        "score": risk_score,
+                        "level": risk_level,
+                        "indicators": indicators,
+                    },
+                }
+            )
+
+        return results
+
+    finally:
+        db.close()
+
+
+# ==============================================================
+# CLI
+# ==============================================================
+
+if __name__ == "__main__":
+    metrics = get_analyst_metrics()
+
+    print("\nSAT-SA ANALYST INTELLIGENCE")
+    print("=" * 70)
+
+    print(
+        f"Analysts analyzed: {len(metrics)}"
+    )
+
+    suspicious = [
+        analyst
+        for analyst in metrics
+        if analyst["risk"]["score"] >= 40
+    ]
+
+    print(
+        f"Analysts requiring attention: "
+        f"{len(suspicious)}"
+    )
+
+    print("\nTop suspicious analysts:")
+
+    for analyst in sorted(
+        suspicious,
+        key=lambda item: item["risk"]["score"],
+        reverse=True,
+    )[:10]:
+
+        print(
+            f"\n{analyst['analyst_id']} - "
+            f"{analyst['name']}"
+        )
+
+        print(
+            f"  Risk: "
+            f"{analyst['risk']['score']}/100 "
+            f"({analyst['risk']['level']})"
+        )
+
+        print(
+            f"  Alerts: "
+            f"{analyst['alerts']['total']}"
+        )
+
+        print(
+            f"  Avg closure: "
+            f"{analyst['performance']['average_closure_time_minutes']} min"
+        )
+
+        print(
+            f"  Evidence review: "
+            f"{analyst['performance']['evidence_review_rate']}%"
+        )
+
+        print(
+            f"  Indicators: "
+            f"{', '.join(analyst['risk']['indicators'])}"
+        )
+
+
+# ============================================================
+# Intelligence Layer Integration
+# ============================================================
+
+from collections import Counter, defaultdict
+
+from sqlalchemy import func
+
+from app.models import Investigation, PeerBenchmark
+from app.services.anomaly.behavioral_anomaly import (
+    calculate_population_metrics,
+    detect_behavioral_anomaly,
+)
+from app.services.gaming.gaming_detection import detect_gaming_behavior
+from app.services.nlp.investigation_nlp import detect_investigation_nlp
+from app.services.peer.peer_benchmark import calculate_peer_benchmark
+from app.services.risk.risk_fusion import fuse_analyst_risk
+
+
+def _safe_float(value, default=0.0):
+    """Convert a value to float without allowing bad DB values to break analytics."""
+    if value is None:
+        return default
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalise_note(note):
+    """Normalize investigation notes for repeated-note detection."""
+    if not note:
+        return ""
+
+    return " ".join(str(note).lower().split())
+
+
+def _build_investigation_intelligence(session):
+    """
+    Build analyst-level NLP and note-quality metrics from investigations.
+    """
+
+    rows = (
+        session.query(
+            Investigation.investigation_id,
+            Investigation.analyst_id,
+            Investigation.investigation_notes,
+            Investigation.evidence_reviewed,
+        )
+        .all()
+    )
+
+    analyst_data = defaultdict(
+        lambda: {
+            "total": 0,
+            "nlp_scores": [],
+            "nlp_confidences": [],
+            "indicators": [],
+            "observations": [],
+            "notes": [],
+        }
+    )
+
+    for row in rows:
+        analyst_id = row.analyst_id
+
+        if not analyst_id:
+            continue
+
+        data = analyst_data[analyst_id]
+        data["total"] += 1
+
+        note = row.investigation_notes or ""
+
+        finding = detect_investigation_nlp(
+            investigation_id=str(row.investigation_id),
+            note=note,
+            evidence_reviewed=row.evidence_reviewed,
+        )
+
+        data["nlp_scores"].append(_safe_float(finding.score))
+        data["nlp_confidences"].append(_safe_float(finding.confidence))
+
+        data["indicators"].extend(
+            list(finding.indicators or [])
+        )
+
+        data["observations"].extend(
+            list(finding.observations or [])
+        )
+
+        normalized = _normalise_note(note)
+
+        if normalized:
+            data["notes"].append(normalized)
+
+    result = {}
+
+    for analyst_id, data in analyst_data.items():
+
+        total = data["total"]
+
+        if total == 0:
+            result[analyst_id] = {
+                "score": 0.0,
+                "confidence": 0.0,
+                "short_note_rate": 0.0,
+                "repeated_note_rate": 0.0,
+                "indicators": [],
+                "observations": [],
+            }
+            continue
+
+        # ----------------------------------------------------
+        # Repeated-note detection
+        # ----------------------------------------------------
+
+        note_counts = Counter(data["notes"])
+
+        repeated_notes = sum(
+            count
+            for count in note_counts.values()
+            if count > 1
+        )
+
+        repeated_note_rate = (
+            repeated_notes / len(data["notes"]) * 100.0
+            if data["notes"]
+            else 0.0
+        )
+
+        # ----------------------------------------------------
+        # Short-note detection
+        # ----------------------------------------------------
+
+        short_notes = sum(
+            1
+            for note in data["notes"]
+            if len(note.split()) < 8
+        )
+
+        short_note_rate = (
+            short_notes / len(data["notes"]) * 100.0
+            if data["notes"]
+            else 0.0
+        )
+
+        # ----------------------------------------------------
+        # Aggregate NLP score
+        # ----------------------------------------------------
+
+        nlp_score = (
+            sum(data["nlp_scores"]) / len(data["nlp_scores"])
+            if data["nlp_scores"]
+            else 0.0
+        )
+
+        confidence = (
+            sum(data["nlp_confidences"])
+            / len(data["nlp_confidences"])
+            if data["nlp_confidences"]
+            else 0.0
+        )
+
+        result[analyst_id] = {
+            "score": round(nlp_score, 2),
+            "confidence": round(confidence, 2),
+            "short_note_rate": round(short_note_rate, 2),
+            "repeated_note_rate": round(repeated_note_rate, 2),
+            "indicators": list(dict.fromkeys(data["indicators"])),
+            "observations": list(dict.fromkeys(data["observations"])),
+        }
+
+    return result
+
+
+def _build_peer_metrics(session):
+    """
+    Convert the real SAT-SA peer_benchmarks schema into the
+    metric names expected by the peer intelligence detector.
+    """
+
+    rows = (
+        session.query(
+            PeerBenchmark.organization_id,
+            PeerBenchmark.metric_name,
+            PeerBenchmark.peer_mean,
+            PeerBenchmark.metric_value,
+            PeerBenchmark.benchmark_period,
+        )
+        .all()
+    )
+
+    metric_mapping = {
+        "avg_closure_time": "average_closure_time_minutes",
+        "escalation_rate": "escalation_rate",
+        "evidence_review_rate": "evidence_review_rate",
+        "mean_investigation_duration":
+            "average_investigation_duration_minutes",
+    }
+
+    peer_data = defaultdict(dict)
+
+    for row in rows:
+
+        canonical_name = metric_mapping.get(row.metric_name)
+
+        if canonical_name is None:
+            continue
+
+        # Prefer peer_mean because this is explicitly the
+        # population/peer baseline.
+        value = row.peer_mean
+
+        if value is None:
+            value = row.metric_value
+
+        if value is None:
+            continue
+
+        peer_data[row.organization_id][canonical_name] = _safe_float(
+            value
+        )
+
+    return dict(peer_data)
+
+
+def _enrich_with_intelligence(base_records, session):
+    """
+    Add behavioral anomaly, gaming, NLP, peer benchmark and
+    final risk-fusion intelligence to the existing analyst records.
+    """
+
+    if not base_records:
+        return base_records
+
+    # --------------------------------------------------------
+    # Prepare common metrics
+    # --------------------------------------------------------
+
+    investigation_intelligence = _build_investigation_intelligence(
+        session
+    )
+
+    peer_data = _build_peer_metrics(session)
+
+    internal_records = []
+
+    for record in base_records:
+
+        analyst_id = record.get("analyst_id")
+
+        performance = record.get("performance") or {}
+        investigations = record.get("investigations") or {}
+
+        nlp = investigation_intelligence.get(
+            analyst_id,
+            {
+                "score": 0.0,
+                "confidence": 0.0,
+                "short_note_rate": 0.0,
+                "repeated_note_rate": 0.0,
+                "indicators": [],
+                "observations": [],
+            },
+        )
+
+        internal = dict(record)
+
+        internal["average_closure_time_minutes"] = _safe_float(
+            performance.get("average_closure_time_minutes")
+        )
+
+        internal["evidence_review_rate"] = _safe_float(
+            performance.get("evidence_review_rate")
+        )
+
+        internal["escalation_rate"] = _safe_float(
+            performance.get("escalation_rate")
+        )
+
+        internal["false_positive_rate"] = _safe_float(
+            performance.get("false_positive_rate")
+        )
+
+        internal["average_queries"] = _safe_float(
+            investigations.get("average_queries")
+        )
+
+        internal["average_actions"] = _safe_float(
+            investigations.get("average_actions")
+        )
+
+        internal["average_investigation_duration_minutes"] = _safe_float(
+            investigations.get("average_duration_minutes")
+        )
+
+        internal["short_note_rate"] = nlp["short_note_rate"]
+
+        internal["repeated_note_rate"] = nlp["repeated_note_rate"]
+
+        internal_records.append(internal)
+
+    # --------------------------------------------------------
+    # Population metrics for behavioral anomaly detector
+    # --------------------------------------------------------
+
+    population_metrics = calculate_population_metrics(
+        internal_records
+    )
+
+    # --------------------------------------------------------
+    # Run intelligence for every analyst
+    # --------------------------------------------------------
+
+    enriched = []
+
+    for record in internal_records:
+
+        analyst_id = record.get("analyst_id")
+        organization_id = record.get("organization_id")
+
+        performance = record.get("performance") or {}
+        investigations = record.get("investigations") or {}
+
+        nlp = investigation_intelligence.get(
+            analyst_id,
+            {
+                "score": 0.0,
+                "confidence": 0.0,
+                "short_note_rate": 0.0,
+                "repeated_note_rate": 0.0,
+                "indicators": [],
+                "observations": [],
+            },
+        )
+
+        # ----------------------------------------------------
+        # Behavioral anomaly
+        # ----------------------------------------------------
+
+        behavioral = detect_behavioral_anomaly(
+            analyst_id=analyst_id,
+            analyst_metrics=record,
+            population_metrics=population_metrics,
+            observation_count=int(
+                (record.get("alerts") or {}).get("total", 0)
+            ),
+        )
+
+        # ----------------------------------------------------
+        # Gaming detection
+        # ----------------------------------------------------
+
+        gaming = detect_gaming_behavior(
+            analyst_id=analyst_id,
+            total_alerts=int(
+                (record.get("alerts") or {}).get("total", 0)
+            ),
+            closed_alerts=int(
+                (record.get("alerts") or {}).get("closed", 0)
+            ),
+            average_closure_time_minutes=_safe_float(
+                performance.get("average_closure_time_minutes")
+            ),
+            evidence_review_rate=_safe_float(
+                performance.get("evidence_review_rate")
+            ),
+            investigation_evidence_review_rate=_safe_float(
+                investigations.get("evidence_review_rate")
+            ),
+            total_investigations=int(
+                investigations.get("total", 0) or 0
+            ),
+            average_queries=_safe_float(
+                investigations.get("average_queries")
+            ),
+            average_actions=_safe_float(
+                investigations.get("average_actions")
+            ),
+            average_investigation_duration_minutes=_safe_float(
+                investigations.get("average_duration_minutes")
+            ),
+            short_note_rate=nlp["short_note_rate"],
+            repeated_note_rate=nlp["repeated_note_rate"],
+        )
+
+        # ----------------------------------------------------
+        # Peer benchmark
+        # ----------------------------------------------------
+
+        analyst_peer_metrics = peer_data.get(
+            organization_id,
+            {}
+        )
+
+        peer = calculate_peer_benchmark(
+            analyst_id=analyst_id,
+            analyst_metrics=record,
+            peer_metrics=analyst_peer_metrics,
+            peer_observations=int(
+                (record.get("alerts") or {}).get("total", 0)
+            ),
+        )
+
+        # ----------------------------------------------------
+        # Existing rule score
+        # ----------------------------------------------------
+
+        existing_risk = record.get("risk") or {}
+
+        rule_score = _safe_float(
+            existing_risk.get("score")
+        )
+
+        rule_indicators = list(
+            existing_risk.get("indicators") or []
+        )
+
+        # ----------------------------------------------------
+        # Final weighted risk fusion
+        # ----------------------------------------------------
+
+        fused_risk = fuse_analyst_risk(
+            analyst_id=analyst_id,
+            rule_score=rule_score,
+            behavioral_anomaly_score=_safe_float(
+                behavioral.score
+            ),
+            gaming_score=_safe_float(
+                gaming.score
+            ),
+            nlp_score=_safe_float(
+                nlp["score"]
+            ),
+            peer_score=_safe_float(
+                peer.score
+            ),
+            observations=int(
+                (record.get("alerts") or {}).get("total", 0)
+            ),
+            rule_indicators=rule_indicators,
+            behavioral_indicators=list(
+                behavioral.indicators or []
+            ),
+            gaming_indicators=list(
+                gaming.indicators or []
+            ),
+            nlp_indicators=list(
+                nlp["indicators"]
+            ),
+            peer_indicators=list(
+                peer.indicators or []
+            ),
+        )
+
+        # ----------------------------------------------------
+        # Preserve existing response and add intelligence
+        # ----------------------------------------------------
+
+        output = dict(record)
+
+        output["behavioral_anomaly"] = {
+            "score": _safe_float(behavioral.score),
+            "severity": behavioral.severity,
+            "confidence": _safe_float(
+                behavioral.confidence
+            ),
+            "indicators": list(
+                behavioral.indicators or []
+            ),
+            "observations": list(
+                behavioral.observations or []
+            ),
+            "metrics": dict(
+                behavioral.metrics or {}
+            ),
+        }
+
+        output["gaming"] = {
+            "score": _safe_float(gaming.score),
+            "severity": gaming.severity,
+            "confidence": _safe_float(
+                gaming.confidence
+            ),
+            "indicators": list(
+                gaming.indicators or []
+            ),
+            "observations": list(
+                gaming.observations or []
+            ),
+            "metrics": dict(
+                gaming.metrics or {}
+            ),
+        }
+
+        output["investigation_nlp"] = {
+            "score": _safe_float(nlp["score"]),
+            "confidence": _safe_float(
+                nlp["confidence"]
+            ),
+            "severity": (
+                "HIGH"
+                if nlp["score"] >= 70
+                else "MEDIUM"
+                if nlp["score"] >= 40
+                else "LOW"
+            ),
+            "indicators": list(
+                nlp["indicators"]
+            ),
+            "observations": list(
+                nlp["observations"]
+            ),
+            "short_note_rate": nlp[
+                "short_note_rate"
+            ],
+            "repeated_note_rate": nlp[
+                "repeated_note_rate"
+            ],
+        }
+
+        output["peer_benchmark"] = {
+            "score": _safe_float(peer.score),
+            "severity": peer.severity,
+            "confidence": _safe_float(
+                peer.confidence
+            ),
+            "indicators": list(
+                peer.indicators or []
+            ),
+            "observations": list(
+                peer.observations or []
+            ),
+            "metrics": dict(
+                peer.metrics or {}
+            ),
+        }
+
+        # The risk-fusion output is now the canonical final risk.
+        output["risk"] = fused_risk
+
+        enriched.append(output)
+
+    return enriched
+
+
+def get_analyst_metrics():
+    """
+    Public analyst metrics API.
+
+    Existing Repo-1 analytics remain the base layer.
+    Repo-2 intelligence is applied afterwards.
+    """
+
+    session = SessionLocal()
+
+    try:
+        base_records = _get_base_analyst_metrics()
+
+        return _enrich_with_intelligence(
+            base_records,
+            session,
+        )
+
+    finally:
+        session.close()
+
