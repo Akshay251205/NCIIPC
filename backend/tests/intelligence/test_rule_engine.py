@@ -568,3 +568,19 @@ def test_rule_engine_evaluate_many():
     assert "AN001" in ids
 
     assert "AN002" in ids
+
+
+def test_rule_engine_logs_and_isolates_rule_failure(caplog):
+    class BrokenRule:
+        rule_id = "BROKEN_RULE"
+
+        def evaluate(self, features):
+            raise RuntimeError("intentional test failure")
+
+    caplog.set_level("ERROR")
+    result = RuleEngine(rules=[BrokenRule()]).evaluate(base_features())
+
+    assert result == []
+    assert "Rule execution failed" in caplog.text
+    assert caplog.records[0].rule == "BROKEN_RULE"
+    assert caplog.records[0].analyst_id == "AN_TEST"

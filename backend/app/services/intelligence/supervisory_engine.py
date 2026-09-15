@@ -4,8 +4,8 @@ SAT-SA Supervisory Intelligence Engine
 
 Purpose
 -------
-Combines analyst, alert and investigation data into a supervisory
-risk assessment.
+Provides supervisory aggregation over the canonical analyst intelligence
+pipeline.  The public execution path does not calculate a risk score itself.
 
 Pipeline
 --------
@@ -17,14 +17,12 @@ E. Gaming Detection
 F. Peer Benchmarking
 G. Behavioral Analytics
 H. Lightweight NLP
-I. Unified Risk Engine
+I. Canonical Risk Fusion
 
 Risk weights
 ------------
-Rule Score          -> 40%
-Behavior Score      -> 30%
-Negative Space      -> 20%
-Peer Score          -> 10%
+Risk weights and thresholds are owned exclusively by
+``app.services.risk.risk_fusion``.
 
 The module intentionally uses lightweight Python logic and SQLAlchemy.
 No NumPy / Pandas / Scikit-learn dependency is required.
@@ -42,7 +40,7 @@ import statistics
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Iterable
 
@@ -54,6 +52,8 @@ from app.models import Alert
 from app.models import Investigation
 from app.models import Asset
 from app.models import AssetActivity
+from app.services.analytics.analyst_metrics import get_analyst_metrics
+from app.services.findings.final_finding import build_final_finding_dict
 
 
 # ============================================================
@@ -2094,7 +2094,12 @@ def finding_to_dict(
 # ============================================================
 
 
-def _run_supervisory_analysis() -> dict[str, Any]:
+def _run_legacy_supervisory_analysis() -> dict[str, Any]:
+    """Deprecated historical implementation retained for unit-test helpers.
+
+    This function is intentionally not called by public APIs.  It remains only
+    while low-level legacy helpers are covered by compatibility tests.
+    """
 
     start = time.perf_counter()
 
@@ -2316,6 +2321,96 @@ def _run_supervisory_analysis() -> dict[str, Any]:
         db.close()
 
 
+def _canonical_supervisory_finding(
+    analyst: dict[str, Any],
+) -> dict[str, Any]:
+    """Adapt the canonical result to the established supervisory API shape."""
+
+    final_finding = build_final_finding_dict(analyst)
+    risk = analyst.get("risk", {})
+    components = risk.get("components", {})
+
+    return {
+        "analyst_id": str(analyst.get("analyst_id", "")),
+        "analyst_name": analyst.get("name", ""),
+        # ``score`` is retained for existing clients; it is the fused score.
+        "score": final_finding["risk_score"],
+        "risk_score": final_finding["risk_score"],
+        "risk_level": final_finding["risk_level"],
+        "severity": final_finding["risk_severity"],
+        "confidence": final_finding["confidence"],
+        "rule_score": components.get("rule", 0.0),
+        "behavior_score": components.get("behavioral"),
+        "negative_space_score": components.get("negative_space"),
+        "peer_score": components.get("peer"),
+        "components": components,
+        "indicators": final_finding["primary_indicators"],
+        "signals": risk.get("signals", []),
+        "explanation": final_finding["explanation"],
+        "evidence": final_finding["evidence"],
+        "recommendations": final_finding["supervisory_actions"],
+        "intelligence": final_finding["intelligence"],
+        "status": final_finding["status"],
+    }
+
+
+def _run_supervisory_analysis() -> dict[str, Any]:
+    """Build supervisory views from canonical Risk Fusion results.
+
+    Analytics loads and enriches the full population in bulk, invokes the
+    authoritative Risk Fusion once per analyst, and exposes its result here
+    for prioritisation and management summaries.  No supervisory-specific
+    scoring is permitted on this path.
+    """
+
+    start = time.perf_counter()
+    analysts = get_analyst_metrics()
+    findings = [
+        _canonical_supervisory_finding(analyst)
+        for analyst in analysts
+    ]
+    findings.sort(key=lambda finding: finding["score"], reverse=True)
+
+    risk_counts = Counter(
+        finding["risk_level"]
+        for finding in findings
+    )
+    average_score = (
+        statistics.fmean(finding["score"] for finding in findings)
+        if findings
+        else 0.0
+    )
+
+    return {
+        "engine_version": "canonical-risk-fusion-v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "summary": {
+            "analysts_analyzed": len(findings),
+            "alerts_analyzed": sum(
+                int((analyst.get("alerts") or {}).get("total", 0) or 0)
+                for analyst in analysts
+            ),
+            "investigations_analyzed": sum(
+                int((analyst.get("investigations") or {}).get("total", 0) or 0)
+                for analyst in analysts
+            ),
+            "analysts_requiring_attention": sum(
+                finding["risk_level"] in {"HIGH", "CRITICAL"}
+                for finding in findings
+            ),
+            "average_risk_score": round(average_score, 2),
+            "risk_distribution": {
+                level: risk_counts.get(level, 0)
+                for level in ("LOW", "MEDIUM", "HIGH", "CRITICAL")
+            },
+        },
+        "performance": {
+            "total_seconds": round(time.perf_counter() - start, 4),
+        },
+        "findings": findings,
+    }
+
+
 # ============================================================
 # Cached Public API
 # ============================================================
@@ -2392,27 +2487,38 @@ def clear_engine_cache() -> None:
 # ============================================================
 
 
-def get_summary() -> dict[str, Any]:
-    return run_supervisory_analysis()[
-        "summary"
+def get_summary(
+    result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return (result or run_supervisory_analysis())["summary"]
+
+
+def get_findings(
+    result: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    return (result or run_supervisory_analysis())["findings"]
+
+
+def get_analyst_findings(
+    result: dict[str, Any] | None = None,
+    analyst_id: str | None = None,
+) -> list[dict[str, Any]]:
+    findings = get_findings(result=result)
+    if analyst_id is None:
+        return findings
+    return [
+        finding
+        for finding in findings
+        if str(finding["analyst_id"]) == str(analyst_id)
     ]
-
-
-def get_findings() -> list[dict[str, Any]]:
-    return run_supervisory_analysis()[
-        "findings"
-    ]
-
-
-def get_analyst_findings() -> list[dict[str, Any]]:
-    return get_findings()
 
 
 def get_analyst_finding(
     analyst_id: str,
+    result: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
 
-    findings = get_findings()
+    findings = get_findings(result=result)
 
     for finding in findings:
 

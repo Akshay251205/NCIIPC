@@ -25,8 +25,12 @@ No machine learning is required here.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
+
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -962,8 +966,13 @@ class RuleEngine:
                 # A single broken rule should not
                 # crash the entire intelligence engine.
                 #
-                # We deliberately do not silently
-                # create a finding here.
+                logger.exception(
+                    "Rule execution failed",
+                    extra={
+                        "rule": getattr(rule, "rule_id", type(rule).__name__),
+                        "analyst_id": features.get("analyst_id"),
+                    },
+                )
                 continue
 
             if signal is not None:
