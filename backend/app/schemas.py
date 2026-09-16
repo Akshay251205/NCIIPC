@@ -108,6 +108,17 @@ class AnalystResponse(BaseModel):
     joined_at: Any
 
 
+class AnalystUpdate(BaseModel):
+    """Editable administrative profile fields for an analyst."""
+
+    name: str | None = None
+    role: str | None = None
+    team: str | None = None
+    experience_years: int | None = None
+    shift: str | None = None
+    status: str | None = None
+
+
 class AnalystMetricResponse(BaseModel):
     analyst_id: str
     name: str

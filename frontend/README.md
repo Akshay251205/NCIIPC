@@ -1,6 +1,29 @@
-# React + TypeScript + Vite
+# SAT-SA frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+The frontend provides two dashboards:
+
+- `/supervisor/dashboard` for supervisory SAT views.
+- `/admin/dashboard` for administration views.
+
+## Run locally
+
+Start the API from the repository root in one terminal:
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
+```
+
+Then start the frontend in another terminal:
+
+```powershell
+cd frontend
+npm run dev
+```
+
+Vite proxies `/api` requests to the FastAPI server at `http://127.0.0.1:8000`.
+
+## Original Vite notes
 
 Currently, two official plugins are available:
 
