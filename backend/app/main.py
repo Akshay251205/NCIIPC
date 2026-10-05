@@ -7,6 +7,7 @@ from app.routers import (
     dashboard,
     findings,
     investigations,
+    auth,
 )
 
 from app.api.routes.intelligence import router as intelligence_router
@@ -69,6 +70,8 @@ app.include_router(
 app.include_router(
     intelligence_router,
 )
+
+app.include_router(auth.router)
 
 
 # ============================================================

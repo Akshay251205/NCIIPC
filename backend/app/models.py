@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
 )
+from sqlalchemy.sql import func
 
 from app.database import Base
 
@@ -487,3 +488,27 @@ class PeerBenchmark(Base):
         DateTime,
         nullable=True,
     )
+
+
+# ============================================================
+# AUTHENTICATION
+# ============================================================
+
+class SupervisorUser(Base):
+    __tablename__ = "supervisor_users"
+
+    id = Column(Integer, primary_key=True)
+    username = Column(String(64), nullable=False, unique=True, index=True)
+    email = Column(String(254), nullable=False, unique=True, index=True)
+    password_hash = Column(String(255), nullable=False)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("supervisor_users.id"), nullable=False, index=True)
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())

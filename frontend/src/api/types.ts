@@ -1,0 +1,11 @@
+export type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL' | string
+export interface Summary { analysts_analyzed: number; alerts_analyzed?: number; investigations_analyzed?: number; analysts_requiring_attention?: number; average_risk_score?: number; risk_distribution?: Record<string, number> }
+export interface IntelligenceSummary { engine_version: string; generated_at?: string; summary: Summary }
+export interface Analyst { analyst_id: string; name: string; organization_id: string; role?: string; team?: string; experience_years?: number; status?: string }
+export interface Page<T> { success: boolean; total: number; page: number; limit: number; data: T[] }
+export interface Alert { alert_id: string; analyst_id?: string; organization_id: string; severity?: string; status?: string; closure_time_minutes?: number; evidence_reviewed?: boolean; escalated?: boolean; false_positive?: boolean; incident_id?: string; created_at?: string }
+export interface Investigation { investigation_id: string; alert_id: string; analyst_id: string; duration_minutes?: number; actions_performed?: string; queries_executed?: number; investigation_notes?: string; escalation_decision?: boolean }
+export interface Asset { asset_id: string; asset_name: string; asset_identifier: string; organization_id: string; asset_type?: string; criticality?: string; status?: string }
+export interface Finding { analyst_id: string; analyst_name?: string; score: number; risk_level: RiskLevel; severity?: string; confidence?: string; indicators?: string[]; [key: string]: unknown }
+export interface Profile { analyst_id: string; risk: { score: number; level: RiskLevel; severity?: string; confidence?: string; components?: Record<string, number>; indicators?: string[]; explanation?: string }; behavioral_anomaly?: Signal; gaming?: Signal; investigation_nlp?: Signal & { average_score?: number; high_findings?: number; medium_findings?: number; investigations_analyzed?: number }; peer_benchmark?: Signal; negative_space?: Signal; evidence?: string[]; evidence_context?: unknown; recommendations?: string[]; explanation?: string }
+export interface Signal { score?: number; average_score?: number; severity?: string; confidence?: string; indicators?: string[]; [key: string]: unknown }
